@@ -5,361 +5,493 @@
 #include<string.h>
 #include<ctype.h>
 #include<assert.h>
-#include"dynarray.h"
 #include<sys/types.h>
 #include<sys/wait.h>
 #include<unistd.h>
 #include<fcntl.h>
+#include<errno.h>
+#include<sys/stat.h>
 
-#define argument_size 100
 
-/*lexical analysis*/
-DynArray_T lexical(char command[], DynArray_T arguments){
-    /*Show status of being inside a particular string*/
-    enum DFAState {OUT, IN};
-    /*quotation mark*/
-    /*prev step indicate space or not*/
-    enum DFAState inQuote=OUT, inSkip=OUT;
-    char buffer[strlen(command)];
+
+#define MAXARGV 10
+#define MAXLINE 1024
+#define MAXBUF 4096
+#define MAXBG 10
+
+void SIGQUIT_handler(int sig);
+void SIGQUIT_handler2(int sig);
+void SIGALRM_handler(int sig);
+void SIGCHLD_handler(int sig);
+
+
+
+pid_t bg[MAXBG];
+int numbg=0;
+enum DFARedir {isLeft, isRight, isPipe};
+int redir[3];
+
+int sepToken(char token){
+    if('|'==token){
+        redir[isPipe]+=1;; return 1;
+    }
+    if('<'==token){
+        redir[isLeft]+=1; return 1;
+    }
+    if('>'==token){
+        redir[isRight]+=1; return 1;
+    }
+    if('&'==token) return 1;
+
+    return 0;
+}
+
+/*
+return 1 if it is bg process
+return 0 if it is fg process
+*/
+int lexical(char *command, char **argv){
+    int isBg=0;
+    static char buffer[MAXBUF];
+    for(int i=0 ; i<MAXBUF ; i++){
+        buffer[i]='\0';
+    }
+
+    enum DFAState {FALSE,TRUE};
+    enum DFAState inQuote=FALSE, inSpace=FALSE;
     int j=0;
 
-    for(int i=0 ; i<=strlen(command); i++){
-        /*reach end of string*/
+    for(int i=0 ; i<=strlen(command) ; i++){
+        if('&'==command[i]) isBg=1;
+
         if(i==strlen(command)){
-            if(IN!=inQuote) break;
-            /*quotation mark doesn't match*/
-            fprintf(stderr,"ERROR - unmatched quote\n"); break;
+            if(FALSE==inQuote) break;
+            else 
+                fprintf(stderr,"unterminated quotation\n");
         }
 
-        /*encounter finds space and it's not inside the quotation*/
-        if(isspace(command[i])!=0 && OUT==inQuote){
-            inSkip=IN; continue;
+        if(isspace(command[i])!=0 && FALSE==inQuote){
+            inSpace=TRUE;
+            continue;
         }
 
-        /*previous character was string*/
-        /*change inskip to out and 
-        put comma to distinguish*/
-        if(IN==inSkip){
-            inSkip=OUT;
+        if(TRUE==inSpace){
+            inSpace=FALSE;
             buffer[j++]=',';
         }
 
-        if('\"'==command[i] && IN==inQuote){
-            inQuote=OUT; continue;
+        if('\"'==command[i] && FALSE==inQuote){
+            inQuote=TRUE; continue;
         }
 
-        if('\"'==command[i] && OUT==inQuote){
-            inQuote=IN; continue;
+        if('\"'==command[i] && TRUE==inQuote){
+            inQuote=FALSE; continue;
         }
 
-        if(IN==inQuote){
-            buffer[j++]=command[i]; continue;
+        if(sepToken(command[i]) && FALSE==inQuote){
+            if(','!=buffer[j-1]) buffer[j++]=',';
+            if('&'!=command[i]) buffer[j++]=command[i];
+            if(' '!=command[i+1]) buffer[j++]=',';
+            continue;
         }
 
-        if(OUT==inQuote && '|'==command[i]){
-            buffer[j++]=command[i]; continue;
-        }
-
-        if(OUT==inQuote && '<'==command[i]){
-            buffer[j++]=command[i]; continue;
-        }
-
-        if(OUT==inQuote && '>'==command[i]){
-            buffer[j++]=command[i]; continue;
-        }
-
-        if(OUT==inQuote && '&'==command[i]){
-            buffer[j++]=command[i]; continue;
-        }
-
-        buffer[j++]=command[i];
+        buffer[j++]=command[i];        
     }
     buffer[j++]=',';
     buffer[j]='\0';
 
-    /*token stores the output of strtok*/
-    /*temp stores token*/
-    /*use static variable to maintain*/
-    static char *token, *temp[argument_size];
-    /*initialize static variable*/
-    token=NULL;
-    for(int i=0 ; i<argument_size ; i++){
-        temp[i]=NULL;
-    }
+    char *token;
+    if((token=strtok(buffer,","))==NULL) exit(-1);
 
-    token=strtok(buffer,",");
-    temp[0]=token;
-    int k;
-    for(k=1 ; k<argument_size ; k++){
-        token=strtok(NULL, ",");
-        if(token==NULL) break;
-        temp[k]=token;
+    argv[0]=token;
+    for(j=1 ; j<=MAXARGV ; j++){
+        if(j==MAXARGV){
+            fprintf(stderr,"Too many arguments\n");
+            assert(0);
+        }
+        if((token=strtok(NULL,","))==NULL) break;
+        argv[j]=token;
     }
-    temp[k]=NULL;
+    argv[j]=NULL;
 
-    /*store tokens to DynArray*/
-    for(k=0 ; temp[k]!=NULL;k++){
-        int add_state=DynArray_add(arguments, temp[k]);
-        if(add_state==0) fprintf(stderr, "DynArray_add fails");
-    }
-    /*return DynArray*/
-    return arguments;
+    return isBg;
 }
 
-//format of output, that is "% argv1 argv2 argv3" 
-void format(DynArray_T arguments){
-    printf("%% ");
-    for(int i=0 ; i<DynArray_getLength(arguments);i++){
-        char *value=DynArray_get(arguments,i);
-        printf("%s ",value);
-    }
-    printf("\n");
+void unix_error(char *msg){
+    fprintf(stderr,"%s\n",msg);
+    assert(0);
 }
 
-/*execute buildin command*/
-/*exit, fg, setenv, unsetenv, cd*/
-void execute_Builtin(DynArray_T arguments){
-    /*store first argument: fg, exit, etc.*/
-    char *first=DynArray_get(arguments,0);
-    char *argv[argument_size];
-    int i,size=DynArray_getLength(arguments);
-    for(i=0 ; i<DynArray_getLength(arguments);i++){
-        char *value=DynArray_get(arguments,i);
-        argv[i]=value;
-    }
-    argv[i]=NULL;
-    /*making argument array*/
+int isBuiltin(char *cmd){
+    if(0==strcmp("setenv",cmd)) return 1;
+    if(0==strcmp("unsetenv",cmd)) return 1;
+    if(0==strcmp("cd",cmd)) return 1;
+    if(0==strcmp("exit",cmd)) return 1;
+    if(0==strcmp("fg",cmd)) return 1;
+    return 0;
+}
 
-    /*exit*/
-    if(0==strcmp(first,"exit")){
+void cmd_Builtin(char **argv, int isBg){
+    if(0==strcmp("exit",argv[0])){
         exit(0);
     }
 
-    /*fg*/
-    if(0==strcmp(first,"fg")){
-    }
-
-    /*setenv*/
-    if(0==strcmp(first,"setenv")){
-        /*the case only setenv and varname is given*/
-        if(size==2){
-            int state=setenv(argv[1],"",1);
-            assert(-1!=state);
+    if(0==strcmp("setenv",argv[0])){
+        if(argv[2]!=NULL){
+            if(setenv(argv[1],argv[2],1)<0)
+                unix_error("setenv error");
         }
-        /*the case when setenv, varname and value is given*/
         else{
-            int state=setenv(argv[1],argv[2],1);
-            assert(-1!=state);
+            if(setenv(argv[1],"",1)<0)
+                unix_error("setenv error");
         }
     }
 
-    /*unsetenv*/
-    if(0==strcmp(first,"unsetenv")){
-        int state=unsetenv(argv[1]);
-        /*unsetenv failed*/
-        assert(-1!=state);
+    if(0==strcmp("unsetenv",argv[0])){
+        if(unsetenv(argv[1])<0)
+            unix_error("unsetenv error");
     }
 
-    /*cd*/
-    if(0==strcmp(first,"cd")){
-        /*home directory*/
-        const char *dir="/mnt/home/20200709";
-        /*both cd and directory is given*/
-        if(size!=1){
-            dir=argv[1];
+    if(0==strcmp("cd",argv[0])){
+        const char *dir="/mnt/c/Users/sjhwa";
+        if(argv[1]!=NULL) dir=argv[1];
+        if(chdir(dir)<0){
+            fprintf(stderr,"No such file or directory\n");
         }
-        int state=chdir(dir);
-        if(-1==state) fprintf(stderr,"./ish: No such file or directory\n");
     }
+
+    if(0==strcmp("fg",argv[0])){
+    if(numbg==0){
+        fprintf(stderr,"fg: current: no such job");
+        return;
+    }
+
+    printf("[%d] Latest background process is executing\n",bg[numbg-1]);
+    pid_t pid;
+    if((pid=waitpid(bg[numbg-1],NULL,0))<0) unix_error("waitpid error");
+    printf("[%d] Done\n",pid);
+    }
+
 }
 
-/*background process*/
-void bg(DynArray_T arguments){
-    char *argv[argument_size];
-    int i;
-    for(i=0 ; i<DynArray_getLength(arguments);i++){
-        char *value=DynArray_get(arguments,i);
-        argv[i]=value;
+void cmd_nonBuiltin(char **argv, int isBg){
+    pid_t pid;
+    fflush(NULL);
+    if((pid=fork())<0) unix_error("fork error");
+    /***************************************************
+    exceed the number of bg process allowed.
+    ***************************************************/
+    if(numbg==MAXBG && isBg==1){
+        fprintf(stderr,"Too many bg processes. ignore command\n");
+        return;
     }
-    argv[i]=NULL;
 
-    int pid;
-    pid=fork();
-    if(pid!=0){
-        wait(NULL);
-    }
-    else{
-        execvp(argv[0], argv);
+    /*child process*/
+    if(pid==0){
+        /*****************************************
+        recover default action for SIGINT and SIGQUIT and SIGCHLD
+        *****************************************/
+        void (*pfRet)(int);
+        if((pfRet=signal(SIGINT,SIG_DFL))==SIG_ERR)
+            unix_error("SIGQUIT_handler error");
+
+        if((pfRet=signal(SIGQUIT,SIG_DFL))==SIG_ERR)
+            unix_error("SIGQUIT_handler error");
+
+        if((pfRet=signal(SIGCHLD,SIG_DFL))==SIG_ERR)
+            unix_error("SIGQUIT_handler error");
+
+        if(execvp(argv[0],argv)<0)
+            fprintf(stderr,"%s: No such file or directory\n",argv[0]);
         exit(0);
-    } 
-}
-
-/*execute non buildin process*/
-void execute_nonBuiltin(DynArray_T arguments){
-    char *argv[argument_size];
-    int i;
-    for(i=0 ; i<DynArray_getLength(arguments);i++){
-        char *value=DynArray_get(arguments,i);
-        if(0==strcmp("&",value)){
-            bg(arguments);
-        }
-        argv[i]=value;
     }
-    argv[i]=NULL;
-    /*convert DynArray to array*/
-
-
-    int pid;
-    pid=fork();
-    if(pid!=0){
-        wait(NULL);
-    }
+    /*parent process*/
     else{
-        int state=execvp(argv[0], argv);
-        /*failed to execute*/
-        if(state==-1)fprintf(stderr,"%s: No such file or directory\n",
-        (char *)DynArray_get(arguments,0));
+        /*fg process*/
+        if(!isBg){
+            if((waitpid(pid,NULL,0))<0) unix_error("waitpid error");
+        }
+        /*bg process*/
+        else{
+            bg[numbg++]=pid;
+            if((waitpid(pid,NULL,WNOHANG))<0) unix_error("waitpid error");
+        }
+
+
     }
-
 }
 
-/*SIGINT handler*/
-static void SIGINT_handler(int isig){
-    pid_t ipid=getpid();
-    if(ipid!=0){return;}
-
-}
-
-/*used for control re-entered SIGQUIT*/
-static void exit_handler(int isig){
+void SIGQUIT_handler2(int sig){
     exit(0);
 }
 
+void SIGQUIT_handler(int sig){
+    void (*pfRet)(int);
+    if((pfRet=signal(SIGALRM, SIGALRM_handler))==SIG_ERR)
+        unix_error("SIGALRM handler error");
 
-/*SIGQUIT handler*/
-static void SIGQUIT_handler(int isig){
-    pid_t ipid=getpid();
-    if(ipid!=0){
-        printf("Type Ctrl-\\ again within 5 seconds to exit.\n");
-        void (*pfRet)(int);
-        /*change SIGQUIT handler*/
-        pfRet=signal(SIGQUIT,exit_handler);
-        assert(pfRet!=SIG_ERR);
-        /*SIGALRM is created after 5sec*/
-        alarm(5);
-    }
+
+    printf("Type Ctrl-\\ again within 5 secones to exit\n");
+
+    
+    if((pfRet=signal(SIGQUIT, SIGQUIT_handler2))==SIG_ERR)
+        unix_error("SIGQUIT handler error");
+
+    alarm(5);  
 }
 
-/*SIGALRM handler*/
-static void SIGALRM_handler(int isig){
-    pid_t ipid=getpid();
-    if(ipid!=0){
-        void (*pfRet)(int);
-        /*change SIGQUIT handler to SIGQUIT_handler not exit_handler*/
-        pfRet=signal(SIGQUIT, SIGQUIT_handler);
-        assert(pfRet!=SIG_ERR);
+void SIGALRM_handler(int sig){
+
+    void (*pfRet)(int);
+    if((pfRet=signal(SIGQUIT, SIGQUIT_handler))==SIG_ERR)
+        unix_error("SIGQUIT handler error");
+
+    if((pfRet=signal(SIGALRM, SIG_DFL))==SIG_ERR)
+        unix_error("SIGALRM handler error");
+}
+
+void SIGCHLD_handler(int sig){
+    if(0==numbg) return;
+
+    pid_t pid;
+    int reaped=0;
+    int i;
+
+    for(i=0 ; i<numbg ; i++){
+        pid=waitpid(bg[i], NULL, WNOHANG);
+        if(pid>0){
+            reaped=1; break;
+        }
+    }
+
+    if(reaped){
+        for(;i<numbg-1;i++){
+            bg[i]=bg[i+1];
+        }
+        bg[i]=0;
+        numbg--;
+        printf("child %d terminated normally\n",pid);
+    }
+    
+}
+
+
+void redirect2(char **argv, int isBg, int walk1, int walk2, int *list){
+    pid_t pid;
+    fflush(NULL);
+    if((pid=fork())<0) unix_error("fork error");
+    /***************************************************
+    exceed the number of bg process allowed.
+    ***************************************************/
+    if(numbg==MAXBG && isBg==1){
+        fprintf(stderr,"Too many bg processes. ignore command\n");
         return;
     }
-}
 
-/*SIGCHLD chandler*/
-static void SIGCHLD_handler(int isig){
-    int status;
-    waitpid(-1, &status, 0);
-}
+    /*child process*/
+    if(pid==0){
+        /*****************************************
+        recover default action for SIGINT and SIGQUIT and SIGCHLD
+        *****************************************/
+        void (*pfRet)(int);
+        if((pfRet=signal(SIGINT,SIG_DFL))==SIG_ERR)
+            unix_error("SIGQUIT_handler error");
 
-int main(void){
-    /*Signal Blocker*/
-    sigset_t sSet;
-    sigemptyset(&sSet);
-    sigaddset(&sSet, SIGINT);
-    sigaddset(&sSet, SIGQUIT);
-    sigaddset(&sSet, SIGALRM);
-    sigaddset(&sSet,SIGCHLD);
-    
-    /*block signals until all signal handler is modified*/
-    sigprocmask(SIG_BLOCK, &sSet, NULL);
+        if((pfRet=signal(SIGQUIT,SIG_DFL))==SIG_ERR)
+            unix_error("SIGQUIT_handler error");
 
-    /*signalHandler*/
-    void (*pfRet)(int);
-    pfRet=signal(SIGINT,SIGINT_handler);
-    assert(pfRet!=SIG_ERR);
-    pfRet=signal(SIGQUIT,exit_handler);
-    assert(pfRet!=SIG_ERR);
-    pfRet=signal(SIGQUIT,SIGQUIT_handler);
-    assert(pfRet!=SIG_ERR);
-    pfRet=signal(SIGALRM, SIGALRM_handler);
-    assert(pfRet!=SIG_ERR);
-    pfRet=signal(SIGCHLD,SIGCHLD_handler);
-    assert(pfRet!=SIG_ERR);
+        if((pfRet=signal(SIGCHLD,SIG_DFL))==SIG_ERR)
+            unix_error("SIGQUIT_handler error");
 
-    /*all SIGhandler has benn changed*/
-    /*unblock SIG*/
-    sigprocmask(SIG_UNBLOCK, &sSet, NULL);
+        
+        if(walk2<0){
+            if(*(list+walk1)==isRight){
+                int fd;
+                for(int i=walk1+1 ; i<MAXARGV && *(argv+i)!=NULL ; i++){
+                    fd=creat(*(argv+i),0600);
+                    close(1);
+                    dup(fd);
+                    close(fd);
+                    execvp(argv[0], argv);
+                    exit(0);
+                }
+            }
 
-
-    const char *file_address="/mnt/home/20200709/.ishrc";
-    /*used to store file stream*/
-    char command[1024];
-    /*open file*/
-    FILE *ishrc=fopen(file_address,"r");
-
-    /*DynArray to store arguments*/
-    /*stdin from ishrc*/
-    /*iteration by ./ishrc*/
-    while(1){
-        /*doesn't exist or not readable*/
-        if(NULL==ishrc) break;
-        /*file stream*/
-        char *fgets_state=fgets(command, 1024, ishrc);
-        /*reached EOF*/
-        if(NULL==fgets_state) break;
-
-        DynArray_T arguments=DynArray_new(0);
-        arguments=lexical(command, arguments);
-
-        /*classify builtin or not*/
-        char *value=DynArray_get(arguments,0);
-        if(0==strcmp("setenv",value) || 0==strcmp("unsetenv",value) || 
-        0==strcmp("cd",value) || 0==strcmp("exit",value) || 0==strcmp("fg",value)){
-            format(arguments);
-            execute_Builtin(arguments);
+            if(*(list+walk1)==isLeft){
+                
+            }
         }
+        
+
+
+    }
+    /*parent process*/
+    else{
+        /*fg process*/
+        if(!isBg){
+            if((waitpid(pid,NULL,0))<0) unix_error("waitpid error");
+        }
+        /*bg process*/
         else{
-            /*clear I/O buffer*/
-            fflush(NULL);
-            format(arguments);
-            execute_nonBuiltin(arguments);
+            bg[numbg++]=pid;
+            if((waitpid(pid,NULL,WNOHANG))<0) unix_error("waitpid error");
         }
-        DynArray_free(arguments);
+
+
+    }
+}
+
+void redirect(char **argv, int isBg){
+    int num=redir[isLeft]+redir[isRight]+redir[isPipe];
+    static int list[MAXARGV];
+    for(int i=0 ; i<MAXARGV ; i++){
+        list[i]=-1;
     }
 
-    /*iteration by stdin*/
+    for(int i=0; argv[i]!=NULL ; i++){
+        if(0==strcmp("<",argv[i])){
+            argv[i]=NULL;
+            list[i]=isLeft;
+            continue;
+        }
+        else if(0==strcmp(">",argv[i])){
+            argv[i]=NULL;
+            list[i]=isRight;
+            continue;
+        }
+        else if(0==strcmp("|",argv[i])){
+            argv[i]=NULL;
+            list[i]=isPipe;
+            continue;
+        }
+    }
+
+    if(0==redir[isPipe]){
+        int walk1, walk2=-1, temp;
+
+        for(walk1=0 ; walk1<MAXARGV ; walk1++){
+            if(-1!=list[walk1]) break;
+        }
+
+        if(num>1){
+            for(temp=walk1+1 ; temp<MAXARGV ; temp++){
+                if(-1!=list[temp]){
+                    walk2=temp;
+                    break;
+                }
+            }
+        }
+        redirect2(argv, isBg, walk1, walk2, list);
+    }
+
+    /*    
+    printf("%d\n",num);
+    for(int i=0, j=0 ; j<num || argv[i]!=NULL ; i++){
+        if(argv[i]==NULL){
+            j++;
+            printf("NULL ");
+            continue;
+        }
+        printf("%s ",argv[i]);
+    }
+    printf("\n");
+
+    for(int i=0 ; i<MAXARGV ; i++){
+        printf("%d ",list[i]);
+    }
+    printf("\n");*/
+    
+}
+
+int mypipe(char **argv){
+    /*pipe token is located at the most beginning of the array*/
+    if(0==strcmp("|",argv[0])) return -1;
+
+    for(int i=0 ; argv[i]!=NULL ; i++){
+        if(0==strcmp("|",argv[i])){
+            /*pipe token is located at the end of the array*/
+            if(i==MAXARGV-1) return -1;
+            /*no command after pipe command*/
+            if(NULL==argv[i+1]) return -1;
+            /*successive pipe token*/
+            if(0==strcmp("|",argv[i+1])) return -1;
+        }
+    }
+
+    for(int i=0 ; argv[i]!=NULL ; i++){
+        if(0==strcmp("|",argv[i])){
+            argv[i]=NULL;
+        }
+    }
+
+    /*
+    for(int i=0, j=0 ; j<redir[isPipe] || argv[i]!=NULL ;i++){
+        if(argv[i]==NULL){
+            printf("NULL\n");
+            j++;
+            continue;
+        }
+        printf("%s\n",argv[i]);
+    }*/
+    
+
+    return redir[isPipe];
+}
+
+
+
+int main(void){
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGQUIT);
+    sigaddset(&set, SIGALRM);
+    sigaddset(&set, SIGCHLD);
+    void (*pfRet)(int);
+
+    int isBg,numpipe;
+    char *fgets_state, command[MAXLINE], *argv[MAXARGV];
+
+    /******************************************************
+    ******************************************************/
     while(1){
-        /*output format*/
+        /*signal preference for parent process*/
+        if((pfRet=signal(SIGINT,SIG_IGN))==SIG_ERR)
+            unix_error("SIGINT_handler error");
+
+        if((pfRet=signal(SIGQUIT,SIGQUIT_handler))==SIG_ERR)
+            unix_error("SIGQUIT_handler error");
+
+        if((pfRet=signal(SIGCHLD,SIGCHLD_handler))==SIG_ERR)
+            unix_error("SIGCHLD_handler error");
+
         printf("%% ");
-        /*input from standard input*/
-        char *fgets_state=fgets(command, 1024, stdin);
-        /*fails to read*/
+        fgets_state=fgets(command, MAXLINE, stdin);
+        /*read function is failed*/
         if(NULL==fgets_state){printf("\n"); break;}
-        /*If there is no input*/
+        /*input line is just a single new line character*/
         if('\n'==*command) continue;
 
-        DynArray_T arguments=DynArray_new(0);
-        arguments=lexical(command, arguments);
-        /*classify builtin or not*/
-        char *value=DynArray_get(arguments,0);
-        if(0==strcmp("setenv",value) || 0==strcmp("unsetenv",value) || 
-        0==strcmp("cd",value) || 0==strcmp("exit",value) || 0==strcmp("fg",value)){
-            execute_Builtin(arguments);
-        }
-        else{
-            /*clear I/O buffer*/
-            fflush(NULL);
-            execute_nonBuiltin(arguments);
-        }
-        DynArray_free(arguments);
 
+        redir[isLeft]=0; redir[isRight]=0; redir[isPipe]=0;
+        isBg=lexical(command, argv);
+
+        /*bg and pipe can't be together*/
+        if(isBg && redir[isPipe]){
+            fprintf(stderr,"| and & are incompatible\n");
+            continue;
+        }
+
+        /*if(redir[isPipe]){
+            if((numpipe=mypipe(argv))==-1){
+                fprintf(stderr,"Invalid: Missing command name\n");
+                continue;
+            }
+        }*/
+        
+        if(redir[isLeft] || redir[isRight] || redir[isPipe]) redirect(argv, isBg);
+        else if(isBuiltin(argv[0])) cmd_Builtin(argv,isBg);
+        else cmd_nonBuiltin(argv,isBg);
     }
 
     return 0;
